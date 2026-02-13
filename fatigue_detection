@@ -1,0 +1,231 @@
+
+import os
+import random
+import numpy as np
+import pandas as pd
+from scipy import signal
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+
+
+
+PROJECT_ROOT = r"C:\Users\dhara\OneDrive\Desktop\project"
+EMG_DIR = "subject_emg"
+LABEL_DIR = "unzip_file"
+
+FS = 1259
+LABEL_FS = 50          # label sampling rate (from paper)
+
+BAND = (20, 450)
+
+WINDOW = 5000          # EMG samples
+STRIDE = 5000
+SEQ_LEN = 5
+
+BATCH_SIZE = 8
+EPOCHS = 40
+LR = 1e-3
+SEED = 42
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+
+
+def bandpass_filter(x):
+    b, a = signal.butter(4, BAND, btype="bandpass", fs=FS)
+    return signal.filtfilt(b, a, x, axis=1)
+
+
+def load_subject_data():
+    data = defaultdict(list)
+
+    emg_root = os.path.join(PROJECT_ROOT, EMG_DIR)
+    label_root = os.path.join(PROJECT_ROOT, LABEL_DIR)
+
+    for subj in sorted(os.listdir(emg_root)):
+        emg_path = os.path.join(emg_root, subj)
+        label_path = os.path.join(label_root, subj)
+
+        if not os.path.isdir(emg_path) or not os.path.isdir(label_path):
+            continue
+
+        for file in sorted(os.listdir(emg_path)):
+            if not file.endswith(".csv") or "mvc" in file.lower():
+                continue
+
+            emg_file = os.path.join(emg_path, file)
+            label_file = os.path.join(label_path, file)
+
+            if not os.path.exists(label_file):
+                continue
+
+            # ---------- EMG ----------
+            emg_df = pd.read_csv(emg_file)
+            num_df = emg_df.select_dtypes(include=np.number)
+
+            time_cols = ["time", "sec", "elapsed", "sample", "timestamp"]
+            emg_cols = [c for c in num_df.columns if not any(k in c.lower() for k in time_cols)]
+
+            if len(emg_cols) < 4:
+                continue
+
+            emg = num_df[emg_cols[:4]].to_numpy().T
+            emg = np.nan_to_num(emg)
+            emg = bandpass_filter(emg)
+
+            # ---------- LABEL ----------
+            lab_df = pd.read_csv(label_file)
+            if "label" not in lab_df.columns:
+                continue
+
+            labels = lab_df["label"].values
+
+            # ---------- WINDOWING ----------
+            total_samples = emg.shape[1]
+
+            for start in range(0, total_samples - WINDOW + 1, STRIDE):
+                end = start + WINDOW
+                win = emg[:, start:end]
+
+                # Normalize
+                win = (win - win.mean(axis=1, keepdims=True)) / \
+                      (win.std(axis=1, keepdims=True) + 1e-6)
+
+                # Time alignment
+                mid_emg_sample = start + WINDOW // 2
+                mid_time_sec = mid_emg_sample / FS
+                label_idx = int(mid_time_sec * LABEL_FS)
+
+                if label_idx >= len(labels):
+                    continue
+
+                window_label = int(labels[label_idx])
+
+                data[subj].append((win.astype(np.float32), window_label))
+
+    print(f"[INFO] Loaded window-level data from {len(data)} subjects")
+    return data
+
+
+
+subject_data = load_subject_data()
+
+subjects = sorted(subject_data.keys())
+random.shuffle(subjects)
+
+train_subjects = subjects[:10]
+test_subjects = subjects[10:13]
+
+print("Train subjects:", train_subjects)
+print("Test subjects :", test_subjects)
+
+
+
+def build_sequences(data, subjects):
+    X, y = [], []
+
+    for subj in subjects:
+        windows = data[subj]
+
+        for i in range(len(windows) - SEQ_LEN + 1):
+            seq = [windows[j][0] for j in range(i, i + SEQ_LEN)]
+            label = windows[i + SEQ_LEN - 1][1]
+            X.append(seq)
+            y.append(label)
+
+    return np.array(X), np.array(y)
+
+X_train, y_train = build_sequences(subject_data, train_subjects)
+X_test, y_test = build_sequences(subject_data, test_subjects)
+
+print("Train sequences:", X_train.shape)
+print("Test sequences :", X_test.shape)
+
+
+
+class SeqDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X)
+        self.y = torch.tensor(y)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+train_loader = DataLoader(SeqDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(SeqDataset(X_test, y_test), batch_size=BATCH_SIZE, shuffle=False)
+
+
+
+class CNN_LSTM(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.cnn = nn.Sequential(
+            nn.Conv1d(4, 32, 7, padding=3),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, 5, padding=2),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1)
+        )
+
+        self.lstm = nn.LSTM(64, 64, batch_first=True)
+        self.fc = nn.Linear(64, 3)
+
+    def forward(self, x):
+        B, T, C, L = x.shape
+        x = x.view(B*T, C, L)
+        f = self.cnn(x).squeeze(-1)
+        f = f.view(B, T, -1)
+        out, _ = self.lstm(f)
+        return self.fc(out[:, -1, :])
+
+
+
+model = CNN_LSTM().to(DEVICE)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=LR)
+
+for epoch in range(EPOCHS):
+    model.train()
+    for xb, yb in train_loader:
+        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+        optimizer.zero_grad()
+        loss = criterion(model(xb), yb)
+        loss.backward()
+        optimizer.step()
+
+    model.eval()
+    preds, trues = [], []
+
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            out = model(xb.to(DEVICE))
+            preds.extend(out.argmax(1).cpu().numpy())
+            trues.extend(yb.numpy())
+
+    acc = accuracy_score(trues, preds)
+    print(f"Epoch {epoch+1}/{EPOCHS} | Test Accuracy: {acc:.3f}")
+
+
+
+print("\nConfusion Matrix:")
+print(confusion_matrix(trues, preds))
+
+print("\nClassification Report:")
+print(classification_report(trues, preds, digits=4))
